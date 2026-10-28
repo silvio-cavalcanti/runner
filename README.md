@@ -192,11 +192,22 @@ sudo chmod 0440 /etc/sudoers.d/90-runner
 
 ## Atualizações e substituições
 
-Todo o provisionamento está no **UserData**. Portanto mudanças em `RunnerCount`, `RunnerLabels`,
+Todo o provisionamento está no **UserData**. Mudanças em `RunnerCount`, `RunnerLabels`,
 `RunnerVersion`, `RunnerEphemeral`, `GitHubScope/Owner/Repo` ou `GitHubTokenSecretArn`
-**substituem a instância** (runners em execução são interrompidos).
+fazem o CloudFormation fazer **stop/start da instância** (~4–5 min de indisponibilidade).
 
-- Alterar apenas `RunnerCount` na mão: `systemctl enable/disable gh-runner@N` (ver acima) sem update de stack.
+> **Atenção:** o cloud-init executa o user data **uma vez por instância**. Depois de um
+> `update-stack` que muda o UserData, a instância sobe com o script novo em
+> `/var/lib/cloud/instance/user-data.txt`, mas o bootstrap **não roda sozinho**. Reaplique
+> (o script é idempotente):
+>
+> ```bash
+> sudo bash /var/lib/cloud/instance/scripts/part-001
+> ```
+>
+> Ou force uma instância nova (ex.: altere `RunnerVersion`) se preferir provisionamento limpo.
+
+- Trocar `RunnerCount` na mão: `systemctl enable/disable gh-runner@N` (ver acima), sem update de stack.
 - O runner tem auto-update ligado; `RunnerVersion` só fixa a versão inicial.
 - O token no secret pode ser rotacionado sem update: o próximo registro lê o valor novo.
   Para forçar: `sudo systemctl restart 'gh-runner@*'`.
