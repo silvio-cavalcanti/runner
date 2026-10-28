@@ -1,0 +1,14 @@
+[
+  { "ParameterKey": "GitHubScope", "ParameterValue": "repository" },
+  { "ParameterKey": "GitHubOwner", "ParameterValue": "minha-org" },
+  { "ParameterKey": "GitHubRepo", "ParameterValue": "meu-repo" },
+  { "ParameterKey": "GitHubTokenSecretArn", "ParameterValue": "arn:aws:secretsmanager:us-east-1:123456789012:secret:github/actions-runner-token-AbCdEf" },
+  { "ParameterKey": "RunnerCount", "ParameterValue": "4" },
+  { "ParameterKey": "RunnerLabels", "ParameterValue": "t3-large" },
+  { "ParameterKey": "InstanceType", "ParameterValue": "t3.large" },
+  { "ParameterKey": "VpcId", "ParameterValue": "vpc-0123456789abcdef0" },
+  { "ParameterKey": "SubnetId", "ParameterValue": "subnet-0123456789abcdef0" },
+  { "ParameterKey": "AssignPublicIp", "ParameterValue": "true" },
+  { "ParameterKey": "EgressMode", "ParameterValue": "restricted" },
+  { "ParameterKey": "VolumeSizeGiB", "ParameterValue": "100" }
+]

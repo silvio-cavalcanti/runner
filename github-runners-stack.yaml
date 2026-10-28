@@ -1,0 +1,626 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >-
+  One EC2 instance (default t3.large) hosting N GitHub Actions self-hosted
+  runners. Each runner runs as an isolated systemd service, is registered as
+  ephemeral (one job per registration) and is re-registered automatically. The
+  host has no inbound access (SSM Session Manager only), encrypted gp3 storage,
+  IMDSv2 enforced and automatic instance recovery.
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+
+Parameters:
+  GitHubScope:
+    Type: String
+    Default: repository
+    AllowedValues:
+      - repository
+      - organization
+    Description: Register the runners at repository level or organization level.
+
+  GitHubOwner:
+    Type: String
+    AllowedPattern: "^[A-Za-z0-9][A-Za-z0-9-]{0,38}$"
+    ConstraintDescription: GitHub user or organization name (letters, digits, hyphen).
+    Description: GitHub user or organization that owns the repository / the organization.
+
+  GitHubRepo:
+    Type: String
+    Default: ""
+    AllowedPattern: "^[A-Za-z0-9._-]*$"
+    Description: Repository name. Required when GitHubScope=repository. Ignored for organization scope.
+
+  GitHubTokenSecretArn:
+    Type: String
+    AllowedPattern: "^arn:aws[a-zA-Z-]*:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:.+$"
+    ConstraintDescription: Must be a Secrets Manager secret ARN in the stack region.
+    Description: >-
+      ARN of a Secrets Manager secret in this region holding a GitHub token
+      (plain string or JSON with a "token" key) that can administer
+      self-hosted runners. Read at runtime by the instance role, never stored
+      in the template.
+
+  RunnerCount:
+    Type: Number
+    Default: 4
+    MinValue: 1
+    MaxValue: 10
+    Description: >-
+      Number of runner services on the instance. Budget roughly 1 runner per
+      vCPU for CPU-heavy jobs (t3.large has 2 vCPU, 8 GiB).
+
+  RunnerLabels:
+    Type: String
+    Default: t3-large
+    AllowedPattern: "^[A-Za-z0-9_,.+ -]*$"
+    Description: >-
+      Comma separated custom labels. "self-hosted", "linux" and "x64" are added
+      by GitHub automatically.
+
+  RunnerGroup:
+    Type: String
+    Default: ""
+    Description: Organization runner group name. Leave empty for the default group. Ignored for repository scope.
+
+  RunnerVersion:
+    Type: String
+    Default: ""
+    AllowedPattern: "^[0-9.]*$"
+    Description: Runner release version (for example 2.338.2). Empty means "latest" resolved at boot.
+
+  RunnerEphemeral:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      true = one job per registration, workspace wiped afterwards (recommended).
+      false = the runner keeps running and takes multiple jobs.
+
+  InstanceType:
+    Type: String
+    Default: t3.large
+    AllowedValues:
+      - t3.large
+      - t3.xlarge
+      - t3.2xlarge
+      - m6i.large
+      - m6i.xlarge
+      - c6i.xlarge
+    Description: Instance type for the runner host.
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+    Description: Ubuntu 24.04 LTS (x64) AMI resolved from the public SSM parameter.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where the runner instance is launched.
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet with outbound internet access (public subnet or NAT gateway).
+
+  AssignPublicIp:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      true for a public subnet with an internet gateway (default). Use false
+      when the subnet egresses through a NAT gateway.
+
+  EgressMode:
+    Type: String
+    Default: restricted
+    AllowedValues:
+      - restricted
+      - all
+    Description: >-
+      restricted allows outbound TCP 80/443 and DNS only - enough for GitHub,
+      package mirrors and container registries. "all" opens every outbound
+      destination for workflows that need SSH, databases, etc.
+
+  SshAllowedCidr:
+    Type: String
+    Default: ""
+    AllowedPattern: "^(|[0-9./]+)$"
+    Description: >-
+      CIDR allowed to SSH (for example 203.0.113.10/32). Empty disables SSH
+      entirely - use SSM Session Manager instead.
+
+  KeyName:
+    Type: String
+    Default: ""
+    Description: Existing EC2 key pair for SSH. Required when SshAllowedCidr is set.
+
+  VolumeSizeGiB:
+    Type: Number
+    Default: 100
+    MinValue: 30
+    MaxValue: 2000
+    Description: Encrypted gp3 root volume size in GiB.
+
+Rules:
+  RepoNameRequired:
+    Assertions:
+      - Assert: !Or
+          - !Equals [!Ref GitHubScope, organization]
+          - !Not [!Equals [!Ref GitHubRepo, ""]]
+        AssertDescription: GitHubRepo is required when GitHubScope is "repository".
+  KeyPairRequiredForSsh:
+    Assertions:
+      - Assert: !Or
+          - !Equals [!Ref SshAllowedCidr, ""]
+          - !Not [!Equals [!Ref KeyName, ""]]
+        AssertDescription: KeyName is required when SshAllowedCidr is provided.
+
+Conditions:
+  IsRepository: !Equals [!Ref GitHubScope, repository]
+  EnableSsh: !Not [!Equals [!Ref SshAllowedCidr, ""]]
+  HasKeyName: !Not [!Equals [!Ref KeyName, ""]]
+  AssignPublicIpEnabled: !Equals [!Ref AssignPublicIp, "true"]
+  AllowAllEgress: !Equals [!Ref EgressMode, all]
+  RestrictedEgress: !Equals [!Ref EgressMode, restricted]
+  UseSshKey: !And
+    - !Condition EnableSsh
+    - !Condition HasKeyName
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Network access: runners only need outbound traffic. Inbound is closed by
+  # default; operators connect through SSM Session Manager.
+  # ---------------------------------------------------------------------------
+  RunnerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          Runners are outbound-only clients of the GitHub API. Keeping inbound
+          closed removes the largest attack surface of a host that executes
+          untrusted workflow code.
+        must: >-
+          Never add 0.0.0.0/0 ingress. SSH, when needed, is scoped to one
+          operator CIDR and requires a key pair.
+    Properties:
+      GroupDescription: GitHub Actions self-hosted runners - outbound only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - !If
+          - EnableSsh
+          - IpProtocol: tcp
+            FromPort: 22
+            ToPort: 22
+            CidrIp: !Ref SshAllowedCidr
+            Description: SSH from the operator CIDR
+          - !Ref "AWS::NoValue"
+      SecurityGroupEgress:
+        - !If
+          - AllowAllEgress
+          - IpProtocol: "-1"
+            CidrIp: 0.0.0.0/0
+            Description: All outbound traffic
+          - !Ref "AWS::NoValue"
+        - !If
+          - RestrictedEgress
+          - IpProtocol: tcp
+            FromPort: 443
+            ToPort: 443
+            CidrIp: 0.0.0.0/0
+            Description: HTTPS to GitHub, registries and package sources
+          - !Ref "AWS::NoValue"
+        - !If
+          - RestrictedEgress
+          - IpProtocol: tcp
+            FromPort: 80
+            ToPort: 80
+            CidrIp: 0.0.0.0/0
+            Description: HTTP for apt package mirrors
+          - !Ref "AWS::NoValue"
+        - !If
+          - RestrictedEgress
+          - IpProtocol: udp
+            FromPort: 53
+            ToPort: 53
+            CidrIp: 0.0.0.0/0
+            Description: DNS
+          - !Ref "AWS::NoValue"
+        - !If
+          - RestrictedEgress
+          - IpProtocol: tcp
+            FromPort: 53
+            ToPort: 53
+            CidrIp: 0.0.0.0/0
+            Description: DNS over TCP
+          - !Ref "AWS::NoValue"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-runners-sg"
+
+  # ---------------------------------------------------------------------------
+  # Instance role: SSM for shell access + read of the GitHub token secret only.
+  # ---------------------------------------------------------------------------
+  RunnerRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          The runner service reads the GitHub token from Secrets Manager at
+          registration time, so the token never appears in user data, logs or
+          the template.
+        must: >-
+          Keep this policy limited to the single secret ARN passed in. Do not
+          attach broad administrative policies to a host that runs workflow
+          code.
+    Properties:
+      Description: GitHub Actions self-hosted runner host role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+      Policies:
+        - PolicyName: read-github-runner-token
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadRunnerTokenSecret
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref GitHubTokenSecretArn
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-runners-role"
+
+  RunnerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref RunnerRole
+
+  # ---------------------------------------------------------------------------
+  # Runner host. Everything (packages, runner binaries, systemd units) is
+  # provisioned from UserData, so changing RunnerCount, RunnerVersion, labels
+  # or the GitHub target replaces the instance.
+  # ---------------------------------------------------------------------------
+  RunnerInstance:
+    Type: AWS::EC2::Instance
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          A single t3.large runs several runner services: cheaper than one VM
+          per runner and enough for short container-based jobs.
+        must: >-
+          Runners are registered ephemeral, so the host never executes two
+          jobs from the same registration and the workspace is wiped between
+          jobs.
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref RunnerSecurityGroup
+      IamInstanceProfile: !Ref RunnerInstanceProfile
+      KeyName: !If [UseSshKey, !Ref KeyName, !Ref "AWS::NoValue"]
+      AssociatePublicIpAddress: !If [AssignPublicIpEnabled, true, !Ref "AWS::NoValue"]
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+        HttpPutResponseHopLimit: 2
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: !Ref VolumeSizeGiB
+            Iops: 3000
+            Throughput: 125
+            Encrypted: true
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-gh-runners"
+        - Key: GitHubTarget
+          Value: !If
+            - IsRepository
+            - !Sub "${GitHubOwner}/${GitHubRepo}"
+            - !Ref GitHubOwner
+      UserData:
+        Fn::Base64: !Sub
+          - |
+            #!/bin/bash
+            set -euo pipefail
+            exec > >(tee -a /var/log/gh-runner-bootstrap.log) 2>&1
+
+            export DEBIAN_FRONTEND=noninteractive
+            export AWS_DEFAULT_REGION="${AWS::Region}"
+            echo "[bootstrap] starting GitHub Actions runners setup"
+
+            # cloud-init / unattended-upgrades may still hold the dpkg lock
+            for attempt in $(seq 1 60); do
+              if ! fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then break; fi
+              sleep 5
+            done
+
+            apt-get update -y -o Acquire::Retries=5
+            apt-get install -y --no-install-recommends \
+              ca-certificates curl jq git unzip tar docker.io psmisc libicu-dev
+            systemctl enable --now docker
+
+            # AWS CLI v2: used at registration time to read the token secret
+            curl -fsSL --retry 5 --retry-delay 5 \
+              https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscliv2.zip
+            unzip -q /tmp/awscliv2.zip -d /tmp
+            /tmp/aws/install --update
+            rm -rf /tmp/aws /tmp/awscliv2.zip
+
+            # Dedicated unprivileged user. docker group = container jobs.
+            id -u runner >/dev/null 2>&1 || useradd -m -s /bin/bash runner
+            usermod -aG docker runner
+
+            install -d -m 0750 -o root -g runner /etc/gh-runner
+            cat > /etc/gh-runner/env <<ENV
+            AWS_DEFAULT_REGION="${AWS::Region}"
+            GH_TOKEN_SECRET_ARN="${GitHubTokenSecretArn}"
+            GH_API_URL="${GitHubApiUrl}"
+            GH_TARGET_URL="${GitHubTargetUrl}"
+            RUNNER_LABELS="${RunnerLabels}"
+            RUNNER_GROUP="${RunnerGroup}"
+            RUNNER_VERSION="${RunnerVersion}"
+            RUNNER_EPHEMERAL="${RunnerEphemeral}"
+            RUNNER_COUNT="${RunnerCount}"
+            ENV
+            chmod 0640 /etc/gh-runner/env
+
+            # --- token helper -------------------------------------------------
+            cat > /usr/local/bin/gh-token.sh <<'TOKEN'
+            #!/bin/bash
+            set -euo pipefail
+            RAW="$(aws secretsmanager get-secret-value \
+              --secret-id "$GH_TOKEN_SECRET_ARN" \
+              --query SecretString --output text)"
+            if printf '%s' "$RAW" | jq -e . >/dev/null 2>&1; then
+              printf '%s' "$RAW" | jq -r '.token // .pat // .github_token // empty'
+            else
+              printf '%s' "$RAW"
+            fi
+            TOKEN
+            chmod 0755 /usr/local/bin/gh-token.sh
+
+            # --- launcher: register one ephemeral runner, then execute it ----
+            cat > /usr/local/bin/gh-runner-run.sh <<'LAUNCHER'
+            #!/bin/bash
+            set -euo pipefail
+
+            INDEX="$1"
+            if [ -z "$INDEX" ]; then
+              echo "runner index required" >&2
+              exit 1
+            fi
+            set -a
+            . /etc/gh-runner/env
+            set +a
+
+            RUNNER_DIR="/opt/actions-runner-$INDEX"
+
+            imds_instance_id() {
+              local token
+              token="$(curl -s --max-time 5 -X PUT \
+                -H "X-aws-ec2-metadata-token-ttl-seconds: 60" \
+                http://169.254.169.254/latest/api/token)" || return 1
+              curl -s --max-time 5 -H "X-aws-ec2-metadata-token: $token" \
+                http://169.254.169.254/latest/meta-data/instance-id
+            }
+
+            if ! INSTANCE_ID="$(imds_instance_id)"; then INSTANCE_ID="$(hostname)"; fi
+            if [ -z "$INSTANCE_ID" ]; then INSTANCE_ID="$(hostname)"; fi
+            RUNNER_NAME="$INSTANCE_ID-$INDEX"
+            log() { echo "[gh-runner:$INDEX] $*"; }
+
+            api() {
+              curl -fsS --retry 3 --retry-delay 5 \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "$@"
+            }
+
+            log "reading GitHub token from Secrets Manager"
+            GH_TOKEN="$(/usr/local/bin/gh-token.sh)"
+            if [ -z "$GH_TOKEN" ]; then
+              log "ERROR: no GitHub token returned by the secret"
+              exit 1
+            fi
+
+            # A crashed ephemeral runner leaves an offline registration behind.
+            # Delete the stale entry so the same name can be registered again.
+            STALE_ID=""
+            PAGE=1
+            while : ; do
+              RESP="$(api "$GH_API_URL?per_page=100&page=$PAGE")"
+              ID="$(printf '%s' "$RESP" | jq -r --arg n "$RUNNER_NAME" \
+                '[.runners[]? | select(.name == $n)][0].id // empty')"
+              if [ -n "$ID" ]; then STALE_ID="$ID"; fi
+              COUNT="$(printf '%s' "$RESP" | jq -r '.runners | length')"
+              if [ "$COUNT" -lt 100 ] || [ "$PAGE" -ge 5 ]; then break; fi
+              PAGE=$((PAGE + 1))
+            done
+            if [ -n "$STALE_ID" ]; then
+              log "deleting stale registration $STALE_ID ($RUNNER_NAME)"
+              api -X DELETE "$GH_API_URL/$STALE_ID" >/dev/null || true
+            fi
+
+            log "requesting registration token"
+            REG_TOKEN="$(api -X POST "$GH_API_URL/registration-token" | jq -r '.token // empty')"
+            if [ -z "$REG_TOKEN" ]; then
+              log "ERROR: could not obtain a registration token"
+              exit 1
+            fi
+
+            cd "$RUNNER_DIR"
+            rm -rf .runner .credentials .credentials_rsaparams _work _diag
+
+            set -- --unattended
+            set -- "$@" --url "$GH_TARGET_URL" --token "$REG_TOKEN"
+            set -- "$@" --name "$RUNNER_NAME" --labels "$RUNNER_LABELS" --work _work
+            if [ "$RUNNER_EPHEMERAL" = "true" ]; then
+              set -- "$@" --ephemeral
+            fi
+            if [ -n "$RUNNER_GROUP" ]; then
+              set -- "$@" --runnergroup "$RUNNER_GROUP"
+            fi
+
+            log "registering runner as $RUNNER_NAME (ephemeral=$RUNNER_EPHEMERAL)"
+            ./config.sh "$@"
+
+            log "starting runner"
+            exec ./run.sh
+            LAUNCHER
+            chmod 0755 /usr/local/bin/gh-runner-run.sh
+
+            # --- systemd template unit ---------------------------------------
+            cat > /etc/systemd/system/gh-runner@.service <<'UNIT'
+            [Unit]
+            Description=GitHub Actions self-hosted runner %i
+            Documentation=https://docs.github.com/actions/hosting-your-own-runners
+            After=network-online.target docker.service
+            Wants=network-online.target
+
+            [Service]
+            Type=simple
+            User=runner
+            Group=runner
+            WorkingDirectory=/opt/actions-runner-%i
+            Environment=HOME=/home/runner
+            ExecStart=/usr/local/bin/gh-runner-run.sh %i
+            Restart=always
+            RestartSec=15
+            KillMode=process
+            KillSignal=SIGINT
+            TimeoutStopSec=5min
+            LimitNOFILE=65536
+
+            [Install]
+            WantedBy=multi-user.target
+            UNIT
+
+            # --- runner binaries (one download, N copies) --------------------
+            set -a; . /etc/gh-runner/env; set +a
+
+            # IAM policy propagation right after stack creation can take a few
+            # seconds, so retry the secret read before giving up.
+            TOKEN=""
+            for attempt in $(seq 1 12); do
+              if TOKEN="$(/usr/local/bin/gh-token.sh)"; then
+                if [ -n "$TOKEN" ]; then break; fi
+              fi
+              echo "[bootstrap] waiting for the GitHub token secret (attempt $attempt)"
+              sleep 10
+            done
+            if [ -z "$TOKEN" ]; then
+              echo "[bootstrap] ERROR: could not read the GitHub token secret"
+              exit 1
+            fi
+
+            VERSION="$RUNNER_VERSION"
+            if [ -z "$VERSION" ]; then
+              VERSION="$(curl -fsSL --retry 3 \
+                -H "Authorization: Bearer $TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                https://api.github.com/repos/actions/runner/releases/latest \
+                | jq -r '.tag_name' | sed 's/^v//')"
+            fi
+            unset TOKEN
+            echo "[bootstrap] runner version: $VERSION"
+
+            mkdir -p /opt/runner-cache
+            curl -fsSL --retry 3 --retry-delay 5 \
+              "https://github.com/actions/runner/releases/download/v$VERSION/actions-runner-linux-x64-$VERSION.tar.gz" \
+              -o /opt/runner-cache/runner.tar.gz
+
+            for i in $(seq 1 "$RUNNER_COUNT"); do
+              install -d -o runner -g runner "/opt/actions-runner-$i"
+              tar -xzf /opt/runner-cache/runner.tar.gz -C "/opt/actions-runner-$i"
+              chown -R runner:runner "/opt/actions-runner-$i"
+            done
+
+            systemctl daemon-reload
+            for i in $(seq 1 "$RUNNER_COUNT"); do
+              systemctl enable --now "gh-runner@$i.service" \
+                || echo "[bootstrap] WARN: gh-runner@$i did not start, check journalctl"
+            done
+
+            echo "[bootstrap] done: $RUNNER_COUNT runner service(s) enabled"
+          - GitHubApiUrl: !If
+              - IsRepository
+              - !Sub "https://api.github.com/repos/${GitHubOwner}/${GitHubRepo}/actions/runners"
+              - !Sub "https://api.github.com/orgs/${GitHubOwner}/actions/runners"
+            GitHubTargetUrl: !If
+              - IsRepository
+              - !Sub "https://github.com/${GitHubOwner}/${GitHubRepo}"
+              - !Sub "https://github.com/${GitHubOwner}"
+            GitHubTokenSecretArn: !Ref GitHubTokenSecretArn
+            RunnerLabels: !Ref RunnerLabels
+            RunnerGroup: !Ref RunnerGroup
+            RunnerVersion: !Ref RunnerVersion
+            RunnerEphemeral: !Ref RunnerEphemeral
+            RunnerCount: !Sub "${RunnerCount}"
+
+  # ---------------------------------------------------------------------------
+  # Status check failures (host-level) recover the instance automatically.
+  # ---------------------------------------------------------------------------
+  InstanceRecoveryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          Ephemeral runners leave no useful local state, so recovering the
+          instance in place is the cheapest way to restore capacity.
+        must: >-
+          Only valid for instance-store-less types such as t3; recovery does
+          not repair a failed EBS volume or a broken user data script.
+    Properties:
+      AlarmDescription: Recover the GitHub runner instance after failed status checks
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref RunnerInstance
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: missing
+      AlarmActions:
+        - !Sub "arn:${AWS::Partition}:automate:${AWS::Region}:ec2:recover"
+
+Outputs:
+  InstanceId:
+    Description: Runner host instance ID.
+    Value: !Ref RunnerInstance
+
+  PrivateIp:
+    Description: Private IP of the runner host.
+    Value: !GetAtt RunnerInstance.PrivateIp
+
+  PublicIp:
+    Description: Public IP (empty when AssignPublicIp=false).
+    Value: !If [AssignPublicIpEnabled, !GetAtt RunnerInstance.PublicIp, ""]
+
+  RunnerLabels:
+    Description: Custom labels to use in runs-on (self-hosted,linux,x64 are implicit).
+    Value: !Ref RunnerLabels
+
+  SsmSessionCommand:
+    Description: Open a shell on the runner host without SSH.
+    Value: !Sub "aws ssm start-session --target ${RunnerInstance}"
+
+  RunnerLogsCommand:
+    Description: Follow the logs of runner 1 (use @2, @3 ... for the others).
+    Value: !Sub "aws ssm start-session --target ${RunnerInstance} --document-name AWS-StartInteractiveCommand --parameters command='journalctl -u gh-runner@1 -f'"

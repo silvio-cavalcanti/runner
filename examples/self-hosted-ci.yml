@@ -1,0 +1,54 @@
+# Exemplo de workflow para os runners criados pelo github-runners-stack.yaml.
+# Copie para .github/workflows/ no repositorio alvo.
+name: CI (self-hosted)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Job simples: roda direto no host do runner.
+  test:
+    runs-on: [self-hosted, linux, x64, t3-large]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          node --version
+          docker --version
+          git --version
+
+      - name: Build e testes
+        run: |
+          # substitua pelos comandos do seu projeto
+          npm ci
+          npm test -- --ci
+
+  # Job com Docker: o runner tem docker.io instalado e o usuario esta no grupo docker.
+  image:
+    runs-on: [self-hosted, linux, x64, t3-large]
+    timeout-minutes: 45
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build da imagem
+        run: docker build -t app:${{ github.sha }} .
+
+      - name: Smoke test
+        run: |
+          docker run --rm app:${{ github.sha }} --version
+
+      # Runners efemeros: cada job comeca em um host limpo, mas o cache de
+      # camadas do Docker e local. Se precisar de cache entre jobs use
+      # actions/cache ou um registry.
+      - name: Limpeza
+        if: always()
+        run: docker image prune -af || true
