@@ -59,6 +59,10 @@ aws secretsmanager create-secret --name github/actions-runner-token --secret-str
 > Se o secret usar uma **CMK própria** do KMS, adicione `kms:Decrypt` na role do stack
 > (o default `aws/secretsmanager` não exige permissão extra).
 
+> **Windows/PowerShell 5.1:** JSON inline perde as aspas ao chamar o CLI (`{token:gho_...}`
+> em vez de `{"token":"gho_..."}`) e o runner falha com **401**. Use o helper
+> `.\scripts\create-token-secret.ps1` (grava o JSON em arquivo) ou `--secret-string file://token.json`.
+
 ### 2. VPC / subnet com saída para a internet
 
 - Subnet pública (IGW) → `AssignPublicIp=true` (padrão).
@@ -118,8 +122,10 @@ jobs:
 | Arquivo | Uso |
 |---|---|
 | `scripts/deploy.ps1` | wrapper de `aws cloudformation deploy` com validação de parâmetros e impressão das saídas |
+| `scripts/create-token-secret.ps1` | cria/atualiza o secret do token GitHub sem quebrar o JSON no Windows |
 | `params.example.json` | exemplo de arquivo de parâmetros (`--parameter-overrides file://params.example.json`) |
 | `examples/self-hosted-ci.yml` | workflow de exemplo com job simples e job Docker |
+| `.github/workflows/runner-smoke.yml` | smoke test que valida host, ferramentas e Docker nos runners |
 
 ```powershell
 .\scripts\deploy.ps1 -Owner minha-org -Repo meu-repo `

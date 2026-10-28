@@ -1,0 +1,29 @@
+name: runner smoke
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  smoke:
+    runs-on: [self-hosted, linux, x64, t3-large]
+    timeout-minutes: 10
+    steps:
+      - name: Identidade do runner
+        run: |
+          echo "host: $(hostname)"
+          echo "kernel: $(uname -mrs)"
+          echo "user: $(id -un)"
+          echo "cpus: $(nproc)"
+          echo "mem: $(free -h | awk '/Mem:/ {print $2}')"
+
+      - name: Ferramentas
+        run: |
+          git --version
+          docker --version
+          aws --version
+
+      - name: Docker funcional
+        run: |
+          docker run --rm hello-world

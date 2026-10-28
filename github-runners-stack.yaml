@@ -303,12 +303,14 @@ Resources:
     Properties:
       ImageId: !Ref LatestAmiId
       InstanceType: !Ref InstanceType
-      SubnetId: !Ref SubnetId
-      SecurityGroupIds:
-        - !Ref RunnerSecurityGroup
+      NetworkInterfaces:
+        - DeviceIndex: "0"
+          SubnetId: !Ref SubnetId
+          GroupSet:
+            - !Ref RunnerSecurityGroup
+          AssociatePublicIpAddress: !If [AssignPublicIpEnabled, true, false]
       IamInstanceProfile: !Ref RunnerInstanceProfile
       KeyName: !If [UseSshKey, !Ref KeyName, !Ref "AWS::NoValue"]
-      AssociatePublicIpAddress: !If [AssignPublicIpEnabled, true, !Ref "AWS::NoValue"]
       MetadataOptions:
         HttpEndpoint: enabled
         HttpTokens: required
@@ -319,7 +321,6 @@ Resources:
             VolumeType: gp3
             VolumeSize: !Ref VolumeSizeGiB
             Iops: 3000
-            Throughput: 125
             Encrypted: true
             DeleteOnTermination: true
       Tags:
@@ -375,6 +376,7 @@ Resources:
             RUNNER_EPHEMERAL="${RunnerEphemeral}"
             RUNNER_COUNT="${RunnerCount}"
             ENV
+            chown root:runner /etc/gh-runner/env
             chmod 0640 /etc/gh-runner/env
 
             # --- token helper -------------------------------------------------
@@ -585,9 +587,9 @@ Resources:
           Only valid for instance-store-less types such as t3; recovery does
           not repair a failed EBS volume or a broken user data script.
     Properties:
-      AlarmDescription: Recover the GitHub runner instance after failed status checks
+      AlarmDescription: Recover the GitHub runner instance after failed system status checks
       Namespace: AWS/EC2
-      MetricName: StatusCheckFailed
+      MetricName: StatusCheckFailed_System
       Dimensions:
         - Name: InstanceId
           Value: !Ref RunnerInstance
